@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use vllm_router_rs::config::{
     CircuitBreakerConfig, ConfigError, ConfigResult, ConnectionMode, DiscoveryConfig,
     HealthCheckConfig, HistoryBackend, MetricsConfig, PolicyConfig, RetryConfig, RouterConfig,
-    RoutingMode,
+    RoutingMode, TraceConfig,
 };
 use vllm_router_rs::metrics::PrometheusConfig;
 use vllm_router_rs::server::{self, ServerConfig};
@@ -206,6 +206,26 @@ struct CliArgs {
     /// Set the logging level
     #[arg(long, default_value = "info", value_parser = ["debug", "info", "warn", "error"])]
     log_level: String,
+
+    /// Enable OpenTelemetry tracing
+    #[arg(
+        long,
+        default_value_t = false,
+        help_heading = "Tracing (OpenTelemetry)"
+    )]
+    enable_trace: bool,
+
+    /// OTLP collector endpoint (format: host:port). If omitted, respects OTEL_EXPORTER_OTLP_ENDPOINT.
+    #[arg(long, help_heading = "Tracing (OpenTelemetry)")]
+    otlp_traces_endpoint: Option<String>,
+
+    /// Parent-based sampling ratio for OpenTelemetry traces.
+    #[arg(long, default_value_t = 1.0, help_heading = "Tracing (OpenTelemetry)")]
+    otel_sampling_ratio: f64,
+
+    /// Exact HTTP paths to exclude from OpenTelemetry server spans.
+    #[arg(long, num_args = 0.., help_heading = "Tracing (OpenTelemetry)")]
+    otel_excluded_paths: Vec<String>,
 
     /// Enable Kubernetes service discovery
     #[arg(long, default_value_t = false)]
@@ -675,6 +695,19 @@ impl CliArgs {
             } else {
                 Some(self.request_id_headers.clone())
             },
+            trace_config: if self.enable_trace {
+                Some(TraceConfig {
+                    otlp_traces_endpoint: self.otlp_traces_endpoint.clone(),
+                    sampling_ratio: self.otel_sampling_ratio,
+                    excluded_paths: if self.otel_excluded_paths.is_empty() {
+                        TraceConfig::default_excluded_paths()
+                    } else {
+                        self.otel_excluded_paths.clone()
+                    },
+                })
+            } else {
+                None
+            },
         }
     }
 }
@@ -790,7 +823,15 @@ Provide --worker-urls or PD flags as usual.",
 
     // Block on the async startup function
     println!("DEBUG: Starting server startup function");
-    runtime.block_on(async move { server::startup(server_config).await })?;
+    runtime.block_on(async move {
+        let result = server::startup(server_config).await;
+        // Shut down OTel while the Tokio runtime is still alive so the
+        // BatchSpanProcessor can flush its final batch.
+        if vllm_router_rs::otel_trace::is_otel_enabled() {
+            vllm_router_rs::otel_trace::shutdown_otel();
+        }
+        result
+    })?;
 
     Ok(())
 }

@@ -1,5 +1,5 @@
 use crate::{
-    config::{ConnectionMode, HistoryBackend, RouterConfig},
+    config::{ConnectionMode, HistoryBackend, RouterConfig, TraceConfig},
     core::{WorkerRegistry, WorkerType},
     data_connector::{MemoryResponseStorage, NoOpResponseStorage, SharedResponseStorage},
     logging::{self, LoggingConfig},
@@ -696,15 +696,36 @@ pub struct ServerConfig {
     pub prometheus_config: Option<PrometheusConfig>,
     pub request_timeout_secs: u64,
     pub request_id_headers: Option<Vec<String>>,
+    pub trace_config: Option<TraceConfig>,
 }
 
-/// Build the Axum application with all routes and middleware
+/// Build the Axum application with all routes and middleware using the
+/// current runtime OpenTelemetry state.
 pub fn build_app(
     app_state: Arc<AppState>,
     max_payload_size: usize,
     request_id_headers: Vec<String>,
     cors_allowed_origins: Vec<String>,
     enable_transparent_proxy: bool,
+) -> Router {
+    build_app_with_request_tracing(
+        app_state,
+        max_payload_size,
+        request_id_headers,
+        cors_allowed_origins,
+        enable_transparent_proxy,
+        crate::otel_trace::is_otel_enabled(),
+    )
+}
+
+/// Build the Axum application with an explicit request-tracing toggle.
+pub fn build_app_with_request_tracing(
+    app_state: Arc<AppState>,
+    max_payload_size: usize,
+    request_id_headers: Vec<String>,
+    cors_allowed_origins: Vec<String>,
+    enable_transparent_proxy: bool,
+    enable_request_tracing: bool,
 ) -> Router {
     // Create routes
     let protected_routes = Router::new()
@@ -763,8 +784,15 @@ pub fn build_app(
         .layer(DefaultBodyLimit::max(max_payload_size))
         .layer(tower_http::limit::RequestBodyLimitLayer::new(
             max_payload_size,
-        ))
-        .layer(middleware::create_logging_layer())
+        ));
+
+    let base_app = if enable_request_tracing {
+        base_app.layer(middleware::create_logging_layer())
+    } else {
+        base_app
+    };
+
+    let base_app = base_app
         .layer(middleware::RequestIdLayer::new(request_id_headers))
         .layer(create_cors_layer(cors_allowed_origins));
 
@@ -786,25 +814,34 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
 
     println!("DEBUG: Initializing logging");
     let _log_guard = if !LOGGING_INITIALIZED.swap(true, Ordering::SeqCst) {
-        Some(logging::init_logging(LoggingConfig {
-            level: config
-                .log_level
-                .as_deref()
-                .and_then(|s| match s.to_uppercase().parse::<Level>() {
-                    Ok(l) => Some(l),
-                    Err(_) => {
-                        warn!("Invalid log level string: '{s}'. Defaulting to INFO.");
-                        None
-                    }
-                })
-                .unwrap_or(Level::INFO),
-            json_format: false,
-            log_dir: config.log_dir.clone(),
-            colorize: true,
-            log_file_name: "vllm-router".to_string(),
-            log_targets: None,
-        }))
+        Some(logging::init_logging(
+            LoggingConfig {
+                level: config
+                    .log_level
+                    .as_deref()
+                    .and_then(|s| match s.to_uppercase().parse::<Level>() {
+                        Ok(l) => Some(l),
+                        Err(_) => {
+                            warn!("Invalid log level string: '{s}'. Defaulting to INFO.");
+                            None
+                        }
+                    })
+                    .unwrap_or(Level::INFO),
+                json_format: false,
+                log_dir: config.log_dir.clone(),
+                colorize: true,
+                log_file_name: "vllm-router".to_string(),
+                log_targets: None,
+            },
+            config.trace_config.clone(),
+        ))
     } else {
+        if config.trace_config.is_some() && !crate::otel_trace::is_otel_enabled() {
+            warn!(
+                "Tracing was requested after logging was already initialized; \
+                 the existing subscriber will continue without enabling OpenTelemetry"
+            );
+        }
         None
     };
     println!("DEBUG: Logging initialized");
@@ -995,12 +1032,13 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     // Enable transparent proxy for all routing modes
     let enable_transparent_proxy = true;
 
-    let app = build_app(
+    let app = build_app_with_request_tracing(
         app_state,
         config.max_payload_size,
         request_id_headers,
         config.router_config.cors_allowed_origins.clone(),
         enable_transparent_proxy,
+        crate::otel_trace::is_otel_enabled(),
     );
 
     let addr = format!("{}:{}", config.host, config.port);

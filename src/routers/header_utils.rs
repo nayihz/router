@@ -2,6 +2,8 @@ use axum::body::Body;
 use axum::extract::Request;
 use axum::http::HeaderMap;
 
+pub use crate::otel_http::TRACE_HEADER_NAMES;
+
 /// Copy request headers to a Vec of name-value string pairs
 /// Used for forwarding headers to backend workers
 pub fn copy_request_headers(req: &Request<Body>) -> Vec<(String, String)> {
@@ -52,18 +54,17 @@ fn should_forward_header(name: &str) -> bool {
     )
 }
 
-/// Header names for W3C Trace Context (OpenTelemetry) propagation
-pub const TRACE_HEADER_NAMES: &[&str] = &["traceparent", "tracestate", "baggage"];
-
 /// Propagate OpenTelemetry trace headers to a reqwest RequestBuilder
 ///
-/// This enables distributed tracing across service boundaries by forwarding
-/// W3C Trace Context headers from incoming requests to outgoing backend requests.
+/// When OTel is enabled: actively injects the current span's trace context,
+/// making the router's span the parent of the backend request's span.
+/// When OTel is disabled: passively forwards existing trace headers from
+/// the incoming request.
 pub fn propagate_trace_headers(
     request: reqwest::RequestBuilder,
     headers: Option<&HeaderMap>,
 ) -> reqwest::RequestBuilder {
-    propagate_headers(request, headers, TRACE_HEADER_NAMES)
+    crate::otel_http::propagate_trace_headers(request, headers)
 }
 
 /// Propagate specific headers from incoming request to outgoing reqwest RequestBuilder
@@ -84,12 +85,9 @@ pub fn propagate_headers(
     header_names: &[&str],
 ) -> reqwest::RequestBuilder {
     if let Some(h) = headers {
-        for (k, v) in h.iter() {
-            if header_names
-                .iter()
-                .any(|&name| k.as_str().eq_ignore_ascii_case(name))
-            {
-                request = request.header(k, v);
+        for &name in header_names {
+            if let Some(value) = h.get(name) {
+                request = request.header(name, value);
             }
         }
     }

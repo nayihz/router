@@ -9,8 +9,10 @@ use std::time::Duration;
 use std::time::Instant;
 use tokio::sync::{mpsc, oneshot};
 use tower::{Layer, Service};
-use tower_http::trace::{MakeSpan, OnRequest, OnResponse, TraceLayer};
+use tower_http::classify::ServerErrorsFailureClass;
+use tower_http::trace::{MakeSpan, OnFailure, OnRequest, OnResponse, TraceLayer};
 use tracing::{debug, error, field::Empty, info, info_span, warn, Span};
+use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 pub use crate::core::token_bucket::TokenBucket;
 
@@ -142,18 +144,53 @@ pub struct RequestSpan;
 
 impl<B> MakeSpan<B> for RequestSpan {
     fn make_span(&mut self, request: &Request<B>) -> Span {
+        let request_path = request.uri().path();
+        if !crate::otel_trace::is_otel_enabled()
+            || crate::otel_trace::is_excluded_http_path(request_path)
+        {
+            return Span::none();
+        }
+
         // Don't try to extract request ID here - it won't be available yet
         // The RequestIdLayer runs after TraceLayer creates the span
-        info_span!(
+
+        // Use MatchedPath (route template) when available for low-cardinality
+        // span names, falling back to the raw URI path otherwise.
+        let route = request
+            .extensions()
+            .get::<axum::extract::MatchedPath>()
+            .map(axum::extract::MatchedPath::as_str);
+        let path_for_name = route.unwrap_or(request_path);
+
+        let span = info_span!(
+            target: "otel_trace",
             "http_request",
-            method = %request.method(),
-            uri = %request.uri(),
-            version = ?request.version(),
+            otel.kind = "server",
+            otel.name = %format_args!("{} {}", request.method(), path_for_name),
+            http.request.method = %request.method(),
+            http.route = Empty,
+            url.path = %request_path,
+            http.response.status_code = Empty,
             request_id = Empty,  // Will be set later
-            status_code = Empty,
-            latency = Empty,
+            latency_ms = Empty,
             error = Empty,
-        )
+        );
+
+        if let Some(route) = route {
+            span.record("http.route", route);
+        }
+
+        // Extract W3C TraceContext (traceparent/tracestate) from incoming request
+        // headers and set it as the parent context on this span. This links the
+        // router's span as a child of the upstream caller's trace.
+        if !span.is_disabled() {
+            let parent_cx = opentelemetry::global::get_text_map_propagator(|propagator| {
+                propagator.extract(&opentelemetry_http::HeaderExtractor(request.headers()))
+            });
+            span.set_parent(parent_cx);
+        }
+
+        span
     }
 }
 
@@ -197,9 +234,18 @@ impl<B> OnResponse<B> for ResponseLogger {
     fn on_response(self, response: &Response<B>, latency: std::time::Duration, span: &Span) {
         let status = response.status();
 
-        // Record these in the span for structured logging/observability tools
-        span.record("status_code", status.as_u16());
-        span.record("latency", format!("{:?}", latency));
+        if !span.is_disabled() {
+            // Record OTel semantic convention attributes only when a real span exists.
+            span.record("http.response.status_code", status.as_u16());
+            span.record("latency_ms", latency.as_secs_f64() * 1000.0);
+
+            if status.is_server_error() {
+                span.set_status(opentelemetry::trace::Status::error(format!(
+                    "HTTP {}",
+                    status.as_u16()
+                )));
+            }
+        }
 
         // Log the response completion
         let _enter = span.enter();
@@ -222,6 +268,40 @@ impl<B> OnResponse<B> for ResponseLogger {
     }
 }
 
+/// Custom on_failure handler for pre-response errors (e.g. connection drops).
+#[derive(Clone, Debug, Default)]
+pub struct FailureLogger;
+
+impl OnFailure<ServerErrorsFailureClass> for FailureLogger {
+    fn on_failure(
+        &mut self,
+        failure: ServerErrorsFailureClass,
+        latency: std::time::Duration,
+        span: &Span,
+    ) {
+        let message = match &failure {
+            ServerErrorsFailureClass::StatusCode(code) => {
+                format!("response failed with status {code}")
+            }
+            ServerErrorsFailureClass::Error(err) => {
+                format!("request failed: {err}")
+            }
+        };
+
+        let _enter = span.enter();
+        error!(
+            target: "vllm_router_rs::response",
+            "{message}"
+        );
+
+        if !span.is_disabled() {
+            span.record("latency_ms", latency.as_secs_f64() * 1000.0);
+            span.record("error", message.as_str());
+            span.set_status(opentelemetry::trace::Status::error(message));
+        }
+    }
+}
+
 /// Create a configured TraceLayer for HTTP logging
 /// Note: Actual request/response logging with request IDs is done in RequestIdService
 pub fn create_logging_layer() -> TraceLayer<
@@ -229,11 +309,17 @@ pub fn create_logging_layer() -> TraceLayer<
     RequestSpan,
     RequestLogger,
     ResponseLogger,
+    (),
+    (),
+    FailureLogger,
 > {
     TraceLayer::new_for_http()
         .make_span_with(RequestSpan)
         .on_request(RequestLogger)
         .on_response(ResponseLogger::default())
+        .on_body_chunk(())
+        .on_eos(())
+        .on_failure(FailureLogger)
 }
 
 /// Structured logging data for requests

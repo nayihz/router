@@ -9,6 +9,7 @@ use crate::core::{
     RetryExecutor, Worker, WorkerFactory, WorkerLoadGuard, WorkerRegistry, WorkerType,
 };
 use crate::metrics::RouterMetrics;
+use crate::otel_http::{self, ClientRequestOptions};
 use crate::policies::{LoadBalancingPolicy, PolicyRegistry};
 use crate::protocols::spec::{
     ChatCompletionRequest, ChatMessage, CompletionRequest, GenerateRequest, RerankRequest,
@@ -1008,13 +1009,23 @@ impl PDRouter {
         };
 
         // Build decode request with shared client
-        let decode_request = self.build_post_with_headers(
-            &self.client,
-            decode.url(),
-            context.route,
-            &json_request,
+        let decode_request_url = Self::backend_request_url(decode.url(), context.route);
+        let decode_request = otel_http::prepare_client_request(
+            self.build_post_with_headers(
+                &self.client,
+                decode.url(),
+                context.route,
+                &json_request,
+                headers,
+                false,
+            ),
             headers,
-            false,
+            ClientRequestOptions {
+                method: "POST",
+                url: &decode_request_url,
+                route: Some(context.route),
+                request_phase: Some("decode"),
+            },
         );
 
         // Send both requests concurrently
@@ -1026,13 +1037,23 @@ impl PDRouter {
 
         if context.return_logprob {
             // Build prefill request with shared client when we need response body
-            let prefill_request = self.build_post_with_headers(
-                &self.client,
-                prefill.url(),
-                context.route,
-                &json_request,
+            let prefill_request_url = Self::backend_request_url(prefill.url(), context.route);
+            let prefill_request = otel_http::prepare_client_request(
+                self.build_post_with_headers(
+                    &self.client,
+                    prefill.url(),
+                    context.route,
+                    &json_request,
+                    headers,
+                    false,
+                ),
                 headers,
-                false,
+                ClientRequestOptions {
+                    method: "POST",
+                    url: &prefill_request_url,
+                    route: Some(context.route),
+                    request_phase: Some("prefill"),
+                },
             );
             // When we need logprobs, wait for both responses
             let (prefill_result, decode_result) =
@@ -1131,24 +1152,31 @@ impl PDRouter {
             // When we don't need logprobs, only wait for decode response
             // Send both requests concurrently but don't wait for prefill
             // Use dedicated prefill client with Connection: close
-            let prefill_future = self
-                .build_post_with_headers(
+            let prefill_request_url = Self::backend_request_url(prefill.url(), context.route);
+            let prefill_request = otel_http::prepare_client_request(
+                self.build_post_with_headers(
                     &self.prefill_client,
                     prefill.url(),
                     context.route,
                     &json_request,
                     headers,
                     true,
-                )
-                .send();
-            let decode_future = decode_request.send();
+                ),
+                headers,
+                ClientRequestOptions {
+                    method: "POST",
+                    url: &prefill_request_url,
+                    route: Some(context.route),
+                    request_phase: Some("prefill"),
+                },
+            );
 
             // Send prefill response to background worker for draining
             // This ensures HTTP compliance without blocking
             let drain_tx = self.prefill_drain_tx.clone();
             let prefill_url = prefill.url().to_string();
             tokio::spawn(async move {
-                if let Ok(response) = prefill_future.await {
+                if let Ok(response) = prefill_request.send().await {
                     // Try to send to drain worker
                     // If channel is full (under extreme load), drain inline as fallback
                     match drain_tx.try_send(response) {
@@ -1182,7 +1210,7 @@ impl PDRouter {
             });
 
             // Wait only for decode response
-            let decode_result = decode_future.await;
+            let decode_result = decode_request.send().await;
             debug!("Received decode response");
 
             // Update metrics
@@ -1640,6 +1668,11 @@ impl PDRouter {
         Ok((prefill_status, prefill_body))
     }
 
+    fn backend_request_url(url: &str, route: &str) -> String {
+        let (base_url, _) = super::dp_utils::parse_worker_url(url);
+        api_path(&base_url, route)
+    }
+
     fn build_post_with_headers(
         &self,
         client: &Client,
@@ -1681,6 +1714,7 @@ impl PDRouter {
                 }
             }
         }
+
         request
     }
 
@@ -2366,16 +2400,24 @@ impl RouterTrait for PDRouter {
         // Add X-data-parallel-rank header for DP-aware routing
         request_builder = dp_utils::add_dp_rank_header(request_builder, decode_worker.dp_rank());
 
-        // Propagate headers
-        request_builder = header_utils::propagate_trace_headers(request_builder, headers);
-
         // Add JSON body if not null
         if !body.is_null() {
             request_builder = request_builder.json(&body);
         }
 
         // Send request
-        match request_builder.send().await {
+        match otel_http::send_client_request(
+            request_builder,
+            headers,
+            ClientRequestOptions {
+                method: "POST",
+                url: &url,
+                route: Some(path),
+                request_phase: Some("inference"),
+            },
+        )
+        .await
+        {
             Ok(response) => {
                 let status = StatusCode::from_u16(response.status().as_u16())
                     .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);

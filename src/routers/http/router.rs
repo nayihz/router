@@ -4,6 +4,7 @@ use crate::core::{
     RetryExecutor, Worker, WorkerRegistry, WorkerType,
 };
 use crate::metrics::RouterMetrics;
+use crate::otel_http::{self, ClientRequestOptions};
 use crate::policies::{LoadBalancingPolicy, PolicyRegistry};
 use crate::protocols::spec::{
     ChatCompletionRequest, CompletionRequest, EmbeddingRequest, GenerateRequest, GenerationRequest,
@@ -422,19 +423,36 @@ impl Router {
 
     // Helper method to proxy GET requests to the first available worker
     async fn proxy_get_request(&self, req: Request<Body>, endpoint: &str) -> Response {
+        let incoming_headers = req.headers();
         let headers = header_utils::copy_request_headers(&req);
 
         match self.select_first_worker() {
             Ok(worker_url) => {
-                let mut request_builder = self.client.get(format!("{}/{}", worker_url, endpoint));
+                let url = format!("{}/{}", worker_url, endpoint);
+                let route_name = format!("/{}", endpoint);
+                let mut request_builder = self.client.get(&url);
                 for (name, value) in headers {
                     let name_lc = name.to_lowercase();
-                    if name_lc != "content-type" && name_lc != "content-length" {
+                    if name_lc != "content-type"
+                        && name_lc != "content-length"
+                        && !header_utils::TRACE_HEADER_NAMES.contains(&name_lc.as_str())
+                    {
                         request_builder = request_builder.header(name, value);
                     }
                 }
 
-                match request_builder.send().await {
+                match otel_http::send_client_request(
+                    request_builder,
+                    Some(incoming_headers),
+                    ClientRequestOptions {
+                        method: "GET",
+                        url: &url,
+                        route: Some(&route_name),
+                        request_phase: None,
+                    },
+                )
+                .await
+                {
                     Ok(res) => {
                         let status = StatusCode::from_u16(res.status().as_u16())
                             .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
@@ -650,9 +668,11 @@ impl Router {
             let base = self.worker_base_url(&worker_url);
 
             let url = format!("{}/{}", base, endpoint);
-            let mut request_builder = match method {
-                Method::GET => self.client.get(url),
-                Method::POST => self.client.post(url),
+            let route_name = format!("/{}", endpoint);
+            let method_name = method.as_str().to_string();
+            let mut request_builder = match method.clone() {
+                Method::GET => self.client.get(&url),
+                Method::POST => self.client.post(&url),
                 _ => {
                     return (
                         StatusCode::METHOD_NOT_ALLOWED,
@@ -665,13 +685,27 @@ impl Router {
             if let Some(hdrs) = headers {
                 for (name, value) in hdrs {
                     let name_lc = name.as_str().to_lowercase();
-                    if name_lc != "content-type" && name_lc != "content-length" {
+                    if name_lc != "content-type"
+                        && name_lc != "content-length"
+                        && !header_utils::TRACE_HEADER_NAMES.contains(&name_lc.as_str())
+                    {
                         request_builder = request_builder.header(name, value);
                     }
                 }
             }
 
-            match request_builder.send().await {
+            match otel_http::send_client_request(
+                request_builder,
+                headers,
+                ClientRequestOptions {
+                    method: &method_name,
+                    url: &url,
+                    route: Some(&route_name),
+                    request_phase: None,
+                },
+            )
+            .await
+            {
                 Ok(res) => {
                     let status = StatusCode::from_u16(res.status().as_u16())
                         .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
@@ -739,53 +773,60 @@ impl Router {
         is_stream: bool,
         load_incremented: bool, // Whether load was incremented for this request
     ) -> Response {
-        let (mut request_builder, extracted_dp_rank) = if self.intra_node_data_parallel_size > 1 {
-            let (worker_url_prefix, dp_rank) = match dp_utils::extract_dp_rank(worker_url) {
-                Ok(tup) => tup,
-                Err(e) => {
-                    error!("Failed to extract dp_rank: {}", e);
-                    return (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("Failed to extract dp_rank: {}", e),
-                    )
-                        .into_response();
-                }
+        let (mut request_builder, extracted_dp_rank, request_url) =
+            if self.intra_node_data_parallel_size > 1 {
+                let (worker_url_prefix, dp_rank) = match dp_utils::extract_dp_rank(worker_url) {
+                    Ok(tup) => tup,
+                    Err(e) => {
+                        error!("Failed to extract dp_rank: {}", e);
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            format!("Failed to extract dp_rank: {}", e),
+                        )
+                            .into_response();
+                    }
+                };
+
+                // Parse the request body
+                let json_val = match serde_json::to_value(typed_req) {
+                    Ok(j) => j,
+                    Err(e) => {
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            format!("Convert into serde_json::Value failed: {}", e),
+                        )
+                            .into_response();
+                    }
+                };
+
+                // Use the original json_val without modification
+
+                let request_url = format!("{}{}", worker_url_prefix, route);
+                (
+                    self.client.post(&request_url).json(&json_val),
+                    Some(dp_rank),
+                    request_url,
+                )
+            } else {
+                let request_url = format!("{}{}", worker_url, route);
+                (
+                    self.client.post(&request_url).json(typed_req),
+                    None,
+                    request_url,
+                )
             };
 
-            // Parse the request body
-            let json_val = match serde_json::to_value(typed_req) {
-                Ok(j) => j,
-                Err(e) => {
-                    return (
-                        StatusCode::BAD_REQUEST,
-                        format!("Convert into serde_json::Value failed: {}", e),
-                    )
-                        .into_response();
-                }
-            };
-
-            // Use the original json_val without modification
-
-            (
-                self.client
-                    .post(format!("{}{}", worker_url_prefix, route))
-                    .json(&json_val),
-                Some(dp_rank),
-            )
-        } else {
-            (
-                self.client
-                    .post(format!("{}{}", worker_url, route))
-                    .json(typed_req),
-                None,
-            ) // Use json() directly with typed request
-        };
-
-        // Copy all headers from original request if provided
+        // Copy all headers from original request if provided, skipping
+        // Content-Type/Content-Length (.json() sets them) and trace headers
+        // (propagate_trace_headers below injects fresh context).
         if let Some(headers) = headers {
             for (name, value) in headers {
-                // Skip Content-Type and Content-Length as .json() sets them
-                if *name != CONTENT_TYPE && *name != CONTENT_LENGTH {
+                if *name != CONTENT_TYPE
+                    && *name != CONTENT_LENGTH
+                    && !header_utils::TRACE_HEADER_NAMES
+                        .iter()
+                        .any(|&th| name.as_str().eq_ignore_ascii_case(th))
+                {
                     request_builder = request_builder.header(name, value);
                 }
             }
@@ -796,7 +837,18 @@ impl Router {
             request_builder = request_builder.header("X-data-parallel-rank", dp_rank.to_string());
         }
 
-        let res = match request_builder.send().await {
+        let res = match otel_http::send_client_request(
+            request_builder,
+            headers,
+            ClientRequestOptions {
+                method: "POST",
+                url: &request_url,
+                route: Some(route),
+                request_phase: Some("inference"),
+            },
+        )
+        .await
+        {
             Ok(res) => res,
             Err(e) => {
                 error!(
@@ -1656,9 +1708,6 @@ impl RouterTrait for Router {
         // Add X-data-parallel-rank header for DP-aware routing
         request_builder = dp_utils::add_dp_rank_header(request_builder, worker.dp_rank());
 
-        // Propagate headers
-        request_builder = header_utils::propagate_trace_headers(request_builder, headers);
-
         // Add JSON body if not null/empty
         if !body.is_null() {
             request_builder = request_builder.json(&body);
@@ -1670,7 +1719,18 @@ impl RouterTrait for Router {
         }
 
         // Send request
-        match request_builder.send().await {
+        match otel_http::send_client_request(
+            request_builder,
+            headers,
+            ClientRequestOptions {
+                method: method.as_str(),
+                url: &url,
+                route: Some(path),
+                request_phase: Some("inference"),
+            },
+        )
+        .await
+        {
             Ok(response) => {
                 let status = response.status();
                 let headers = response.headers().clone();

@@ -9,6 +9,8 @@ pub mod data_connector;
 pub mod grpc;
 pub mod metrics;
 pub mod middleware;
+pub mod otel_http;
+pub mod otel_trace;
 pub mod policies;
 pub mod protocols;
 pub mod routers;
@@ -98,6 +100,9 @@ struct Router {
     model_path: Option<String>,
     // Explicit tokenizer path
     tokenizer_path: Option<String>,
+    // OpenTelemetry tracing
+    enable_trace: bool,
+    otlp_traces_endpoint: Option<String>,
 }
 
 impl Router {
@@ -317,6 +322,9 @@ impl Router {
         // Tokenizer defaults
         model_path = None,
         tokenizer_path = None,
+        // Tracing defaults
+        enable_trace = false,
+        otlp_traces_endpoint = None,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -378,6 +386,8 @@ impl Router {
         rate_limit_tokens_per_second: Option<usize>,
         model_path: Option<String>,
         tokenizer_path: Option<String>,
+        enable_trace: bool,
+        otlp_traces_endpoint: Option<String>,
     ) -> PyResult<Self> {
         // Determine connection mode from worker URLs
         let mut all_urls = worker_urls.clone();
@@ -456,6 +466,8 @@ impl Router {
             connection_mode,
             model_path,
             tokenizer_path,
+            enable_trace,
+            otlp_traces_endpoint,
         })
     }
 
@@ -517,6 +529,14 @@ impl Router {
                 prometheus_config,
                 request_timeout_secs: self.request_timeout_secs,
                 request_id_headers: self.request_id_headers.clone(),
+                trace_config: if self.enable_trace {
+                    Some(config::TraceConfig {
+                        otlp_traces_endpoint: self.otlp_traces_endpoint.clone(),
+                        ..Default::default()
+                    })
+                } else {
+                    None
+                },
             })
             .await
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))

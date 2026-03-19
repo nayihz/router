@@ -1,6 +1,5 @@
 // vLLM PD (Prefill-Decode) Router Implementation
 // This module extends PDRouter to handle vLLM-specific two-stage processing
-use super::super::header_utils;
 use super::dp_utils;
 use super::logprobs_merge;
 use super::pd_router::PDRouter;
@@ -8,6 +7,7 @@ use super::pd_types::{error_chain, PDRouterError};
 use super::vllm_service_discovery::{ServiceRegistry, ServiceType};
 use crate::core::{BasicWorker, Worker, WorkerType};
 use crate::metrics::RouterMetrics;
+use crate::otel_http::{self, ClientRequestOptions};
 use crate::policies::PolicyRegistry;
 use crate::routers::{RouterTrait, WorkerManagement};
 use async_trait::async_trait;
@@ -410,9 +410,7 @@ impl VllmPDRouter {
             .header("Content-Type", "application/json")
             .header("X-Request-Id", &request_id); // P2P coordination metadata in header
 
-        // Propagate trace headers and add X-data-parallel-rank header using shared utilities
-        prefill_request_builder =
-            header_utils::propagate_trace_headers(prefill_request_builder, headers);
+        // Add X-data-parallel-rank header using shared utilities
         prefill_request_builder =
             dp_utils::add_dp_rank_header(prefill_request_builder, prefill_dp_rank);
         if let Some(rank) = prefill_dp_rank {
@@ -422,10 +420,18 @@ impl VllmPDRouter {
             );
         }
 
-        let prefill_response = match prefill_request_builder
-            .body(prefill_request_str)
-            .send()
-            .await
+        let prefill_request_url = format!("http://{}{}", prefill_base_http, path);
+        let prefill_response = match otel_http::send_client_request(
+            prefill_request_builder.body(prefill_request_str),
+            headers,
+            ClientRequestOptions {
+                method: "POST",
+                url: &prefill_request_url,
+                route: Some(path),
+                request_phase: Some("prefill"),
+            },
+        )
+        .await
         {
             Ok(resp) => resp,
             Err(e) => {
@@ -522,9 +528,7 @@ impl VllmPDRouter {
             .header("Content-Type", "application/json")
             .header("X-Request-Id", &request_id); // Same P2P coordination metadata in header
 
-        // Propagate trace headers and add X-data-parallel-rank header using shared utilities
-        decode_request_builder =
-            header_utils::propagate_trace_headers(decode_request_builder, headers);
+        // Add X-data-parallel-rank header using shared utilities
         decode_request_builder =
             dp_utils::add_dp_rank_header(decode_request_builder, decode_dp_rank);
         if let Some(rank) = decode_dp_rank {
@@ -534,7 +538,19 @@ impl VllmPDRouter {
             );
         }
 
-        let decode_response = match decode_request_builder.body(decode_request_str).send().await {
+        let decode_request_url = format!("http://{}{}", decode_base_http, path);
+        let decode_response = match otel_http::send_client_request(
+            decode_request_builder.body(decode_request_str),
+            headers,
+            ClientRequestOptions {
+                method: "POST",
+                url: &decode_request_url,
+                route: Some(path),
+                request_phase: Some("decode"),
+            },
+        )
+        .await
+        {
             Ok(resp) => resp,
             Err(e) => {
                 let full_error = error_chain(&e);
@@ -741,13 +757,22 @@ impl VllmPDRouter {
             )
             .header("X-Request-Id", &request_id);
 
-        // Propagate trace headers and add X-data-parallel-rank header using shared utilities
-        prefill_request_builder =
-            header_utils::propagate_trace_headers(prefill_request_builder, headers);
+        // Add X-data-parallel-rank header using shared utilities
         prefill_request_builder =
             dp_utils::add_dp_rank_header(prefill_request_builder, prefill_dp_rank);
 
-        let prefill_response = match prefill_request_builder.json(&prefill_request).send().await {
+        let prefill_response = match otel_http::send_client_request(
+            prefill_request_builder.json(&prefill_request),
+            headers,
+            ClientRequestOptions {
+                method: "POST",
+                url: &prefill_url,
+                route: Some(path),
+                request_phase: Some("prefill"),
+            },
+        )
+        .await
+        {
             Ok(resp) => resp,
             Err(e) => {
                 prefill_worker.decrement_load();
@@ -881,13 +906,22 @@ impl VllmPDRouter {
             )
             .header("X-Request-Id", &request_id);
 
-        // Propagate trace headers and add X-data-parallel-rank header using shared utilities
-        decode_request_builder =
-            header_utils::propagate_trace_headers(decode_request_builder, headers);
+        // Add X-data-parallel-rank header using shared utilities
         decode_request_builder =
             dp_utils::add_dp_rank_header(decode_request_builder, decode_dp_rank);
 
-        let decode_response = match decode_request_builder.json(&decode_request).send().await {
+        let decode_response = match otel_http::send_client_request(
+            decode_request_builder.json(&decode_request),
+            headers,
+            ClientRequestOptions {
+                method: "POST",
+                url: &decode_url,
+                route: Some(path),
+                request_phase: Some("decode"),
+            },
+        )
+        .await
+        {
             Ok(resp) => resp,
             Err(e) => {
                 decode_worker.decrement_load();
